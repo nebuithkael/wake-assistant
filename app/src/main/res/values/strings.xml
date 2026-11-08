@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">小深唤醒</string>
+    <string name="hint_access_key">Picovoice AccessKey</string>
+    <string name="hint_deepseek_key">DeepSeek API Key</string>
+    <string name="hint_keyword">唤醒词文件（.ppn）</string>
+    <string name="pick_keyword">选择唤醒词文件</string>
+    <string name="chinese">中文唤醒词（需要 porcupine_params_zh.pv）</string>
+    <string name="start">开始常驻监听</string>
+    <string name="stop">停止</string>
+    <string name="idle">未开启</string>
+    <string name="running">正在监听</string>
+</resources>
