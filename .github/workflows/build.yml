@@ -44,3 +44,14 @@ jobs:
           name: wake-assistant-debug
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+
+      - name: Publish APK to repo
+        if: success()
+        run: |
+          git config user.name "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          mkdir -p apk
+          cp app/build/outputs/apk/debug/app-debug.apk apk/wake-assistant.apk
+          git add -f apk/wake-assistant.apk
+          git commit -m "ci: apk [skip ci]" || true
+          git push || true
