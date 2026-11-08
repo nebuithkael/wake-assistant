@@ -42,6 +42,33 @@ class AudioEngine {
         return r.read(buffer, 0, buffer.size)
     }
 
+    private fun read(buffer: ShortArray, offset: Int, len: Int): Int {
+        val r = record ?: return 0
+        return r.read(buffer, offset, len)
+    }
+
+    /** 读满一整帧；读不满就用静音补齐（唤醒库要求固定帧长）。 */
+    fun readFully(buffer: ShortArray): Int {
+        var filled = 0
+        var idle = 0
+        while (filled < buffer.size) {
+            val n = read(buffer, filled, buffer.size - filled)
+            if (n <= 0) {
+                if (++idle > 100) break
+                try {
+                    Thread.sleep(5)
+                } catch (_: InterruptedException) {
+                    break
+                }
+                continue
+            }
+            idle = 0
+            filled += n
+        }
+        if (filled < buffer.size) java.util.Arrays.fill(buffer, filled, buffer.size, 0)
+        return filled
+    }
+
     fun stop() {
         record?.let {
             try {

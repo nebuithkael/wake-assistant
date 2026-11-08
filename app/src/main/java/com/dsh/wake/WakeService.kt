@@ -121,13 +121,13 @@ class WakeService : Service() {
             val frame = ShortArray(porcupine!!.frameLength)
             setMode("正在聆听")
             while (running.get()) {
-                val n = audio.read(frame)
+                val n = audio.readFully(frame)
                 if (n <= 0) {
                     Thread.sleep(20)
                     continue
                 }
                 val hit = try {
-                    porcupine!!.process(frame, n) >= 0
+                    porcupine!!.process(frame) >= 0
                 } catch (e: Exception) {
                     Log.w(tag, "porcupine", e)
                     false
@@ -151,7 +151,7 @@ class WakeService : Service() {
         val builder = Porcupine.Builder().setAccessKey(prefs.accessKey)
         if (prefs.chinese && modelPath.exists()) builder.setModelPath(modelPath.absolutePath)
         builder.setKeywordPaths(arrayOf(prefs.keywordPath))
-        porcupine = builder.build()
+        porcupine = builder.build(this)
 
         val voskDir = File(filesDir, "vosk").listFiles()?.firstOrNull { it.isDirectory }
             ?: throw IllegalStateException("识别模型还没准备好")
@@ -173,7 +173,7 @@ class WakeService : Service() {
         var totalMs = 0
         try {
             while (running.get()) {
-                val n = audio.read(frame)
+                val n = audio.readFully(frame)
                 if (n <= 0) {
                     Thread.sleep(10)
                     continue
