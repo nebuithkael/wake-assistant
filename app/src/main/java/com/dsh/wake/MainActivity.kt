@@ -10,7 +10,6 @@ import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
 import android.widget.Button
-import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
@@ -24,24 +23,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var prefs: Prefs
     private lateinit var status: TextView
     private lateinit var toggle: Button
-    private lateinit var keywordLabel: TextView
-
-    private val pickFile =
-        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
-            if (uri == null) return@registerForActivityResult
-            try {
-                val dest = File(filesDir, "porcupine/keyword.ppn").apply { parentFile?.mkdirs() }
-                contentResolver.openInputStream(uri).use { input ->
-                    requireNotNull(input) { "读不到这个文件" }
-                    dest.outputStream().use { out -> input.copyTo(out) }
-                }
-                prefs.keywordPath = dest.absolutePath
-                keywordLabel.text = "已选择：${uri.lastPathSegment ?: "keyword.ppn"}"
-                Toast.makeText(this, "唤醒词已就位", Toast.LENGTH_SHORT).show()
-            } catch (e: Exception) {
-                Toast.makeText(this, "导入失败：${e.message}", Toast.LENGTH_LONG).show()
-            }
-        }
 
     private val askPermissions =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
@@ -59,25 +40,15 @@ class MainActivity : AppCompatActivity() {
 
         status = findViewById(R.id.status)
         toggle = findViewById(R.id.toggle)
-        keywordLabel = findViewById(R.id.keywordLabel)
 
-        val accessKey = findViewById<EditText>(R.id.accessKey)
         val deepseekKey = findViewById<EditText>(R.id.deepseekKey)
-        val chinese = findViewById<CheckBox>(R.id.chineseSwitch)
-        val pick = findViewById<Button>(R.id.pickKeyword)
+        val wakeWord = findViewById<EditText>(R.id.wakeWord)
 
-        accessKey.setText(prefs.accessKey)
         deepseekKey.setText(prefs.deepseekKey)
-        chinese.isChecked = prefs.chinese
-        keywordLabel.text = if (prefs.keywordPath.isEmpty()) {
-            getString(R.string.hint_keyword)
-        } else {
-            "已选择：${File(prefs.keywordPath).name}"
-        }
+        wakeWord.setText(prefs.wakeWord)
+
         status.text = if (WakeState.running) getString(R.string.running) else getString(R.string.idle)
         toggle.text = if (WakeState.running) getString(R.string.stop) else getString(R.string.start)
-
-        pick.setOnClickListener { pickFile.launch(arrayOf("*/*")) }
 
         toggle.setOnClickListener {
             if (WakeState.running) {
@@ -86,11 +57,10 @@ class MainActivity : AppCompatActivity() {
                 status.text = getString(R.string.idle)
                 toggle.text = getString(R.string.start)
             } else {
-                prefs.accessKey = accessKey.text.toString().trim()
                 prefs.deepseekKey = deepseekKey.text.toString().trim()
-                prefs.chinese = chinese.isChecked
+                prefs.wakeWord = wakeWord.text.toString().trim().ifEmpty { "小深" }
                 if (!prefs.ready()) {
-                    Toast.makeText(this, "先把两个 Key 和唤醒词文件填好", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, "先填 DeepSeek API Key", Toast.LENGTH_LONG).show()
                     return@setOnClickListener
                 }
                 askAudioPermission()
@@ -100,20 +70,10 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        if (WakeState.running && !isServiceRunning()) {
-            WakeState.running = false
-            status.text = getString(R.string.idle)
-            toggle.text = getString(R.string.start)
-        } else if (WakeState.running) {
+        if (WakeState.running) {
             status.text = getString(R.string.running)
             toggle.text = getString(R.string.stop)
         }
-    }
-
-    private fun isServiceRunning(): Boolean {
-        // 简单判断：通知还在就认为在跑（服务本身由系统托管）。
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
-        return manager.activeNotifications.any { it.id == 42 }
     }
 
     private fun askAudioPermission() {
@@ -126,10 +86,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun prepareAndStart() {
-        status.text = "准备模型…"
+        if (File(filesDir, "vosk").listFiles()?.any { it.isDirectory } == true) {
+            startListening()
+            return
+        }
+        status.text = "下载识别模型…"
         Thread {
             try {
-                if (prefs.chinese) ensureChineseParams()
                 ensureVoskModel { p -> runOnUiThread { status.text = "下载识别模型 $p%" } }
                 runOnUiThread { startListening() }
             } catch (e: Exception) {
@@ -147,7 +110,7 @@ class MainActivity : AppCompatActivity() {
         WakeState.running = true
         status.text = getString(R.string.running)
         toggle.text = getString(R.string.stop)
-        Toast.makeText(this, "说「小深」试试", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "叫一声「${prefs.wakeWord}」试试", Toast.LENGTH_SHORT).show()
     }
 
     private fun requestBatteryExemption() {
@@ -165,23 +128,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun ensureChineseParams() {
-        val dest = File(filesDir, "porcupine/porcupine_params_zh.pv")
-        if (dest.exists() && dest.length() > 0) return
-        runOnUiThread { status.text = "下载中文唤醒模型…" }
-        Downloader.download(
-            "https://raw.githubusercontent.com/Picovoice/porcupine/master/lib/common/porcupine_params_zh.pv",
-            dest,
-        )
-        if (!dest.exists() || dest.length() == 0L) {
-            throw IllegalStateException("中文唤醒模型下载失败")
-        }
-    }
-
     private fun ensureVoskModel(onProgress: (Int) -> Unit) {
         val root = File(filesDir, "vosk")
-        val existing = root.listFiles()?.firstOrNull { it.isDirectory }
-        if (existing != null) return
+        if (root.listFiles()?.any { it.isDirectory } == true) return
         val zip = File(cacheDir, "vosk-cn.zip")
         Downloader.download(
             "https://alphacephei.com/vosk/models/vosk-model-small-cn-0.22.zip",

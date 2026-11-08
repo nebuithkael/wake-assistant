@@ -13,6 +13,11 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "0.1.0"
+
+        ndk {
+            // 只打这台手机的架构，包体积小一半以上
+            abiFilters += listOf("arm64-v8a")
+        }
     }
 
     buildTypes {
@@ -39,9 +44,6 @@ android {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
-
-    // 唤醒词：离线、低功耗，个人免费
-    implementation("ai.picovoice:porcupine-android:3.0.1")
 
     // 语音转文字：离线 Vosk，中文小模型约 42 MB
     implementation("com.alphacephei:vosk-android:0.3.47")

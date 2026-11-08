@@ -1,6 +1,5 @@
 package com.dsh.wake
 
-import ai.picovoice.porcupine.Porcupine
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -23,25 +22,27 @@ import org.vosk.Model
 import org.vosk.Recognizer
 import java.io.File
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.sqrt
 
 /**
- * 常驻监听：唤醒词 → 录一句 → 本机转写 → DeepSeek → 朗读 → 回到监听。
- * 全程离线转写，只有问答那一步联网。
+ * 常驻监听：本机离线识别，听到唤醒词就进入听写，然后问 DeepSeek 并朗读。
+ * 唤醒词和转写共用一个 Vosk 中文模型，不需要任何账号或联网授权。
  */
 class WakeService : Service() {
 
     private val tag = "WakeService"
     private lateinit var prefs: Prefs
     private lateinit var audio: AudioEngine
-    private val running = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val running = AtomicBoolean(false)
 
-    private var porcupine: Porcupine? = null
     private var voskModel: Model? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var worker: Thread? = null
     private var tone: ToneGenerator? = null
+
+    private val aliases = ArrayList<String>()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -79,21 +80,16 @@ class WakeService : Service() {
 
     override fun onDestroy() {
         running.set(false)
+        try {
+            audio.stop()
+        } catch (_: Exception) {
+        }
         worker?.join(1500)
         release()
         super.onDestroy()
     }
 
     private fun release() {
-        try {
-            audio.stop()
-        } catch (_: Exception) {
-        }
-        try {
-            porcupine?.delete()
-        } catch (_: Exception) {
-        }
-        porcupine = null
         try {
             voskModel?.close()
         } catch (_: Exception) {
@@ -116,26 +112,62 @@ class WakeService : Service() {
 
     private fun loop() {
         try {
-            initEngines()
+            val dir = File(filesDir, "vosk").listFiles()?.firstOrNull { it.isDirectory }
+                ?: throw IllegalStateException("识别模型还没准备好")
+            LibVosk.setLogLevel(org.vosk.LogLevel.WARNINGS)
+            voskModel = Model(dir.absolutePath)
             audio.start()
-            val frame = ShortArray(porcupine!!.frameLength)
-            setMode("正在聆听")
+
+            val word = prefs.wakeWord.trim().ifEmpty { "小深" }
+            aliases.clear()
+            aliases.add(word)
+            aliases.add(word.replace("小", "晓"))
+            aliases.add(word.replace("深", "生"))
+            aliases.add(word.replace("深", "沈"))
+            setMode("正在聆听「$word」")
+
+            val frame = ShortArray(FRAME)
+            var recognizer = Recognizer(voskModel, 16000.0f)
+            var framesSinceReset = 0
+
             while (running.get()) {
                 val n = audio.readFully(frame)
                 if (n <= 0) {
                     Thread.sleep(20)
                     continue
                 }
-                val hit = try {
-                    porcupine!!.process(frame) >= 0
-                } catch (e: Exception) {
-                    Log.w(tag, "porcupine", e)
-                    false
-                }
-                if (hit) {
+                recognizer.acceptWaveForm(toBytes(frame, n), n * 2)
+                val heard = textOf(recognizer.partialResult)
+
+                if (containsWake(heard)) {
                     onWake()
-                    listenAndAnswer(frame)
-                    setMode("正在聆听")
+                    var command = capture(recognizer)
+                    try {
+                        recognizer.close()
+                    } catch (_: Exception) {
+                    }
+                    recognizer = Recognizer(voskModel, 16000.0f)
+                    framesSinceReset = 0
+                    if (command.isEmpty()) {
+                        // 只叫了名字没说话：再等一句，这时不带唤醒词
+                        command = capture(recognizer)
+                        try {
+                            recognizer.close()
+                        } catch (_: Exception) {
+                        }
+                        recognizer = Recognizer(voskModel, 16000.0f)
+                    }
+                    if (command.isNotEmpty()) answer(command)
+                    setMode("正在聆听「$word」")
+                    continue
+                }
+
+                if (++framesSinceReset > 600) {
+                    try {
+                        recognizer.reset()
+                    } catch (_: Exception) {
+                    }
+                    framesSinceReset = 0
                 }
             }
         } catch (e: Exception) {
@@ -146,80 +178,43 @@ class WakeService : Service() {
         }
     }
 
-    private fun initEngines() {
-        val modelPath = File(filesDir, "porcupine/porcupine_params_zh.pv")
-        val builder = Porcupine.Builder().setAccessKey(prefs.accessKey)
-        if (prefs.chinese && modelPath.exists()) builder.setModelPath(modelPath.absolutePath)
-        builder.setKeywordPaths(arrayOf(prefs.keywordPath))
-        porcupine = builder.build(this)
+    /** 收一句命令：等到说完（静音 1 秒）或超时，返回去掉唤醒词的文字。 */
+    private fun capture(recognizer: Recognizer): String {
+        val frame = ShortArray(FRAME)
+        var speech = false
+        var silenceMs = 0
+        var totalMs = 0
+        var last = ""
+        while (running.get()) {
+            val n = audio.readFully(frame)
+            if (n <= 0) {
+                Thread.sleep(10)
+                continue
+            }
+            val frameMs = n * 1000 / 16000
+            totalMs += frameMs
+            recognizer.acceptWaveForm(toBytes(frame, n), n * 2)
 
-        val voskDir = File(filesDir, "vosk").listFiles()?.firstOrNull { it.isDirectory }
-            ?: throw IllegalStateException("识别模型还没准备好")
-        LibVosk.setLogLevel(org.vosk.LogLevel.WARNINGS)
-        voskModel = Model(voskDir.absolutePath)
+            val partial = textOf(recognizer.partialResult)
+            if (partial.length > last.length) {
+                last = partial
+                speech = true
+                silenceMs = 0
+            } else if (speech && rms(frame, n) < 700) {
+                silenceMs += frameMs
+            }
+
+            if (speech && silenceMs > 1000) break
+            if (!speech && totalMs > 4000) break
+            if (totalMs > 15000) break
+        }
+        val finalText = textOf(recognizer.finalResult)
+        return stripWake(if (finalText.isNotEmpty()) finalText else last)
     }
 
     private fun onWake() {
         tone?.startTone(ToneGenerator.TONE_PROP_ACK, 120)
-        setMode("正在听你说…")
-    }
-
-    private fun listenAndAnswer(frame: ShortArray) {
-        val model = voskModel ?: return
-        val recognizer = Recognizer(model, 16000.0f)
-        val bytes = ByteArray(frame.size * 2)
-        var speechSeen = false
-        var silenceMs = 0
-        var totalMs = 0
-        try {
-            while (running.get()) {
-                val n = audio.readFully(frame)
-                if (n <= 0) {
-                    Thread.sleep(10)
-                    continue
-                }
-                val frameMs = n * 1000 / 16000
-                totalMs += frameMs
-
-                if (rms(frame, n) > 600) {
-                    speechSeen = true
-                    silenceMs = 0
-                } else if (speechSeen) {
-                    silenceMs += frameMs
-                }
-
-                for (i in 0 until n) {
-                    val v = frame[i].toInt()
-                    bytes[i * 2] = (v and 0xFF).toByte()
-                    bytes[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
-                }
-                recognizer.acceptWaveForm(bytes, n * 2)
-
-                if (speechSeen && silenceMs > 1000) break
-                if (!speechSeen && totalMs > 5000) break
-                if (totalMs > 15000) break
-            }
-        } finally {
-            val json = try {
-                recognizer.finalResult
-            } catch (_: Exception) {
-                "{}"
-            }
-            try {
-                recognizer.close()
-            } catch (_: Exception) {
-            }
-            val question = try {
-                JSONObject(json).optString("text", "").trim()
-            } catch (_: Exception) {
-                ""
-            }
-            if (question.isEmpty()) {
-                setMode("没听清，继续聆听")
-                return
-            }
-            answer(question)
-        }
+        setMode("在听，请说")
     }
 
     private fun answer(question: String) {
@@ -243,6 +238,37 @@ class WakeService : Service() {
         }
         engine.stop()
         engine.speak(text, TextToSpeech.QUEUE_FLUSH, null, "reply")
+    }
+
+    // ---------------- 小工具 ----------------
+
+    private fun containsWake(text: String): Boolean {
+        if (text.isEmpty()) return false
+        return aliases.any { it.isNotEmpty() && text.contains(it) }
+    }
+
+    private fun stripWake(text: String): String {
+        var out = text
+        aliases.sortedByDescending { it.length }.forEach { out = out.replace(it, "") }
+        out = out.replace(Regex("^[，,。.、\\s]+"), "")
+        return out.trim()
+    }
+
+    private fun textOf(json: String): String = try {
+        val o = JSONObject(json)
+        o.optString("text", "").ifEmpty { o.optString("partial", "") }
+    } catch (_: Exception) {
+        ""
+    }
+
+    private fun toBytes(frame: ShortArray, n: Int): ByteArray {
+        val bytes = ByteArray(n * 2)
+        for (i in 0 until n) {
+            val v = frame[i].toInt()
+            bytes[i * 2] = (v and 0xFF).toByte()
+            bytes[i * 2 + 1] = ((v shr 8) and 0xFF).toByte()
+        }
+        return bytes
     }
 
     private fun rms(frame: ShortArray, n: Int): Double {
@@ -308,6 +334,7 @@ class WakeService : Service() {
     companion object {
         private const val CHANNEL = "wake"
         private const val NOTIF_ID = 42
+        private const val FRAME = 1600
         const val ACTION_STOP = "com.dsh.wake.STOP"
     }
 }
